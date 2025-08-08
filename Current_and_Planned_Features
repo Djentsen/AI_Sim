@@ -1,0 +1,87 @@
+## Features
+
+### Complete Features
+
+#### World & Terrain
+- Procedurally generated 2D grid-based world using Pygame
+- Two terrain types: **grass** and **water**
+- Randomized terrain with natural-looking **water clumps**
+
+#### Environment Systems
+- **Fertility map** affecting food growth per tile
+- **Food regrowth system** based on fertility and randomness
+- **Scent map** that diffuses over time to attract lifeforms to food
+- **Water scent map** used for lifeform hydration behavior
+- **Fertility regeneration** for long-term ecosystem health
+
+#### AI Leader (LLM-Powered)
+- Autonomous **AI leader** powered by OpenAI’s GPT-4
+- Makes decisions every 30 seconds (900 ticks) based on simulation data
+- Accepts **structured JSON responses** with clear reasoning
+- Snapshot includes population, average energy/age, user guidance, tick count
+
+##### Supported AI Actions:
+- `"spawn_food"` – adds food randomly
+- `"spawn_lifeform"` – adds new lifeforms to the world
+- `"kill_lifeform"` – removes a random lifeform
+- `"alter_lifeform_traits"` – mutates lifeform stats
+- `"move_lifeform"` – randomly repositions lifeforms
+- `"place_home_base"` – adds a base for a team
+- `"change_terrain"` – toggles grass ↔ water
+- `"create_barrier"` – creates a horizontal water wall
+- `"adjust_environment"` – globally boosts fertility
+- `"change_group_behavior"` – *placeholder only*
+
+#### Lifeform Simulation
+- Lifeforms have:
+  - Age, energy, water, speed, reproduction cooldowns
+  - Inventory: food, water, base affinity (by color)
+- Behavioral logic includes:
+  - Scent-based food seeking
+  - Water collection from tiles and bases
+  - Base loyalty (same-color)
+  - Resource deposition and sharing
+  - Intelligent **reproduction conditions** (must be near base, well-fed, etc.)
+  - Death by age, starvation, or dehydration
+
+#### Home Base System
+- 10x8 team-colored bases placed by AI
+- Stores food and water collected by lifeforms
+- Supports reproduction and survival
+- Emits scent to attract matching lifeforms
+
+#### AI Chat & Guidance UI
+- AI decision log visible on screen
+- User can type **custom guidance** (`> your input here`) to influence AI
+- Display panel shows:
+  - Ticks
+  - Population
+  - Avg energy & water
+  - AI reasoning
+
+#### Memory System
+- Stores summary of each run in `last_run.json`
+- AI receives previous run’s snapshot to enable memory-based improvement
+- Auto-loads on startup if file exists
+
+#### System & Architecture
+- Secure OpenAI API key loading via `.env` file
+- Uses `python-dotenv`, `pygame`, and `openai` packages
+- Frame-based game loop at 30 FPS
+- Clean modular code (terrain, AI, UI, lifeforms, memory)
+
+---
+
+### Planned / In Development Features
+
+- AI-driven group behavior modification (`"change_group_behavior"`)
+- Social interaction between lifeforms (e.g., cooperation or conflict)
+- More terrain types and environmental effects (e.g., weather, elevation)
+- Reproduction influenced by inherited traits or environment
+- Web-based visualization (using Pyodide or WebAssembly)
+- Metrics tracking: population graphs, trait stats, heatmaps
+- Full automation (AI proposes + executes changes autonomously)
+- Save/load multiple run histories for longitudinal learning
+- Visual AI decision log or timeline (for debugging or observation)
+
+---
