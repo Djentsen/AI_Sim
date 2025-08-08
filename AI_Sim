@@ -1,0 +1,636 @@
+# === Imports ===
+import json
+import os
+import random
+import re
+import sys
+
+import pygame
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# === Environment Setup ===
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# === Constants ===
+TILE_SIZE = 6
+GRID_WIDTH = 120
+GRID_HEIGHT = 100
+WINDOW_WIDTH = GRID_WIDTH * TILE_SIZE + 300
+WINDOW_HEIGHT = GRID_HEIGHT * TILE_SIZE + 100
+
+TERRAIN_TYPES = {
+    "grass": (34, 139, 34),
+    "water": (70, 130, 180),
+}
+
+# === Global Variables ===
+growth_multiplier = 0.45
+ai_full_message_log = []
+tick_counter = 0
+MIN_REPRO_AGE = 200
+AI_DECISION_INTERVAL = 900 # Every 900 ticks (30 seconds at 30 FPS)
+
+# === Pygame Initialization ===
+pygame.init()
+font = pygame.font.SysFont(None, 24)
+small_font = pygame.font.SysFont(None, 20)
+screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+pygame.display.set_caption("AI Micro-Society World")
+clock = pygame.time.Clock()
+paused = False
+
+# === Terrain Generation ===
+def generate_terrain():
+    grid = [["grass" for _ in range(GRID_WIDTH)] for _ in range(GRID_HEIGHT)]
+    clumps = 10
+    for _ in range(clumps):
+        cx = random.randint(10, GRID_WIDTH - 10)
+        cy = random.randint(10, GRID_HEIGHT - 10)
+        for _ in range(random.randint(20, 40)):
+            dx = random.randint(-3, 3)
+            dy = random.randint(-3, 3)
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < GRID_WIDTH and 0 <= ny < GRID_HEIGHT:
+                grid[ny][nx] = "water"
+    return grid
+
+world = generate_terrain()
+food_grid = [[0 for _ in range(GRID_WIDTH)] for _ in range(GRID_HEIGHT)]
+fertility_map = [
+    [random.uniform(0.001, 0.02) if world[y][x] == "grass" else 0 for x in range(GRID_WIDTH)]
+    for y in range(GRID_HEIGHT)
+]
+scent_map = [[0.0 for _ in range(GRID_WIDTH)] for _ in range(GRID_HEIGHT)]
+water_scent_map = [[1.0 if world[y][x] == "water" else 0.0 for x in range(GRID_WIDTH)] for y in range(GRID_HEIGHT)]
+
+user_input = ""
+user_guidance = ""
+input_active = False
+
+# === Memory System ===
+LAST_RUN_FILE = "last_run.json"
+if os.path.exists(LAST_RUN_FILE):
+    with open(LAST_RUN_FILE, "r") as f:
+        last_run_memory = json.load(f)
+else:
+    last_run_memory = {}
+
+# === Simulation State ===
+highest_population = 0
+lifeforms = []
+memory_log = []
+ai_response_text = ""
+pending_code_change = None
+
+# === Utility Functions ===
+def save_memory():
+    snapshot = get_world_snapshot()
+    snapshot["highest_population"] = highest_population
+    with open(LAST_RUN_FILE, "w") as f:
+        json.dump(snapshot, f, indent=2)
+
+def get_lifeform_averages():
+    if not lifeforms:
+        return 0, 0
+    total_energy = sum(l.energy for l in lifeforms)
+    total_water = sum(l.water for l in lifeforms)
+    return total_energy / len(lifeforms), total_water / len(lifeforms)
+
+def draw_counters():
+    tick_text = font.render(f"Ticks: {tick_counter}", True, (255, 255, 255))
+    population_text = font.render(f"Lifeforms: {len(lifeforms)}", True, (255, 255, 255))
+    ai_text_display = ai_response_text.strip() if ai_response_text.strip() else "AI not Implemented"
+    ai_text = font.render(f"AI: {ai_text_display}", True, (200, 200, 255))
+
+    # Top-left
+    screen.blit(tick_text, (10, 10))
+    screen.blit(population_text, (10, 30))
+
+    # Right-side panel
+    avg_energy, avg_water = get_lifeform_averages()
+    energy_text = font.render(f"Avg Energy: {avg_energy:.1f}", True, (255, 255, 255))
+    water_text = font.render(f"Avg Water:  {avg_water:.1f}", True, (100, 180, 255))
+
+    panel_x = GRID_WIDTH * TILE_SIZE + 20
+    screen.blit(energy_text, (panel_x, 20))
+    screen.blit(water_text, (panel_x, 50))
+
+def update_water_scent_map():
+    for y in range(GRID_HEIGHT):
+        for x in range(GRID_WIDTH):
+            water_scent_map[y][x] = 1.0 if world[y][x] == "water" else 0.0
+
+def update_scent_map():
+    decay = 0.95
+    diffusion = 0.1
+    for y in range(GRID_HEIGHT):
+        for x in range(GRID_WIDTH):
+            scent = scent_map[y][x] * decay
+            if food_grid[y][x] > 0:
+                scent += 1.0
+            avg_neighbor_scent = 0
+            count = 0
+            for dy in [-1, 0, 1]:
+                for dx in [-1, 0, 1]:
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < GRID_WIDTH and 0 <= ny < GRID_HEIGHT:
+                        avg_neighbor_scent += scent_map[ny][nx]
+                        count += 1
+            if count > 0:
+                scent += (avg_neighbor_scent / count - scent_map[y][x]) * diffusion
+            scent_map[y][x] = scent
+
+def regrow_food():
+    for _ in range(5):
+        cx = random.randint(5, GRID_WIDTH - 6)
+        cy = random.randint(5, GRID_HEIGHT - 6)
+        for _ in range(20):
+            dx = random.randint(-2, 2)
+            dy = random.randint(-2, 2)
+            x, y = cx + dx, cy + dy
+            if 0 <= x < GRID_WIDTH and 0 <= y < GRID_HEIGHT:
+                if world[y][x] == "grass" and random.random() < fertility_map[y][x] * 3 * growth_multiplier:
+                    food_grid[y][x] += 1
+
+def regenerate_fertility():
+    for y in range(GRID_HEIGHT):
+        for x in range(GRID_WIDTH):
+            if world[y][x] == "grass" and fertility_map[y][x] < 0.0005:
+                fertility_map[y][x] += 0.00001
+
+def get_world_snapshot():
+    return {
+        "lifeform_count": len(lifeforms),
+        "average_energy": sum(l.energy for l in lifeforms) / len(lifeforms) if lifeforms else 0,
+        "average_age": sum(l.age for l in lifeforms) / len(lifeforms) if lifeforms else 0,
+        "user_guidance": user_guidance,
+        "tick": pygame.time.get_ticks(),
+    }
+
+# === AI Action Handler ===
+def apply_ai_action(decision):
+    action = decision.get("action")
+    reason = decision.get("reason", "No reason provided")
+    print("[AI ACTION]", action, "-", reason)
+
+    if action == "spawn_food":
+        for _ in range(10):
+            x = random.randint(0, GRID_WIDTH - 1)
+            y = random.randint(0, GRID_HEIGHT - 1)
+            if world[y][x] == "grass":
+                food_grid[y][x] += 1
+
+    elif action == "spawn_lifeform":
+        for _ in range(5):
+            x = random.randint(0, GRID_WIDTH - 1)
+            y = random.randint(0, GRID_HEIGHT - 1)
+            if world[y][x] == "grass":
+                lifeforms.append(Lifeform(x, y))
+
+    elif action == "kill_lifeform" and lifeforms:
+        lifeforms.remove(random.choice(lifeforms))
+
+    elif action == "alter_lifeform_traits":
+        for lf in random.sample(lifeforms, min(5, len(lifeforms))):
+            lf.max_energy += random.randint(-20, 20)
+            lf.speed = max(1, lf.speed + random.choice([-1, 0, 1]))
+            lf.max_age += random.randint(-100, 100)
+
+    elif action == "move_lifeform":
+        for lf in random.sample(lifeforms, min(5, len(lifeforms))):
+            lf.x = random.randint(0, GRID_WIDTH - 1)
+            lf.y = random.randint(0, GRID_HEIGHT - 1)
+
+    elif action == "place_home_base":
+        x = random.randint(0, GRID_WIDTH - 10)
+        y = random.randint(0, GRID_HEIGHT - 8)
+        color = random.choice([(255, 0, 0), (0, 255, 0), (0, 0, 255)])
+        place_home_base(x, y, color)
+
+    elif action == "change_terrain":
+        for _ in range(30):
+            x = random.randint(0, GRID_WIDTH - 1)
+            y = random.randint(0, GRID_HEIGHT - 1)
+            world[y][x] = "water" if world[y][x] == "grass" else "grass"
+
+    elif action == "create_barrier":
+        y = random.randint(10, GRID_HEIGHT - 10)
+        for x in range(GRID_WIDTH):
+            world[y][x] = "water"
+
+    elif action == "adjust_environment":
+        for y in range(GRID_HEIGHT):
+            for x in range(GRID_WIDTH):
+                if world[y][x] == "grass":
+                    fertility_map[y][x] *= 1.1
+
+    elif action == "change_group_behavior":
+        print("[TODO] Group behavior change logic can be implemented here.")
+
+    else:
+        print("[AI] No recognized action to apply.")
+
+# === AI Prompt & Response ===
+def ask_ai_leader(snapshot):
+    prompt = f"""
+    Here is the current state of the simulation:
+    Lifeforms: {snapshot['lifeform_count']}
+    Avg Energy: {snapshot['average_energy']:.2f}
+    Avg Age: {snapshot['average_age']:.2f}
+    User Guidance: {snapshot['user_guidance']}
+    Tick: {snapshot['tick']}
+
+    Decide what action to take next. Respond ONLY with a JSON object like:
+    {{
+        "action": "spawn_lifeform",
+        "reason": "Population is low and energy levels are stable."
+    }}
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You are a helpful and strategic AI leader."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+
+    try:
+        content = response.choices[0].message.content
+        print("\n[RAW AI RESPONSE]:\n", content)
+        ai_full_message_log.append(content)
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        return json.loads(match.group(0)) if match else {"action": "none", "reason": "No valid JSON returned."}
+    except Exception as e:
+        return {"action": "none", "reason": f"Error parsing AI response: {e}"}
+
+# Optional fallback AI action (not used if already handled above)
+def apply_ai_action(decision):
+    global growth_multiplier
+    if decision["action"] == "boost_growth":
+        growth_multiplier *= 0.5
+    elif decision["action"] == "reduce_growth":
+        growth_multiplier *= 0.5
+
+
+# === UI: Chat Box Drawing ===
+def draw_chat_box():
+    pygame.draw.rect(screen, (20, 20, 20), (0, WINDOW_HEIGHT - 100, WINDOW_WIDTH, 100))
+    ai_text = ai_response_text if ai_response_text else "AI: AI not Implemented"
+    draw_wrapped_text(screen, ai_text, 10, WINDOW_HEIGHT - 95, WINDOW_WIDTH - 20, small_font, (200, 200, 255))
+    draw_wrapped_text(screen, "> " + user_input, 10, WINDOW_HEIGHT - 25, WINDOW_WIDTH - 20, small_font, (0, 255, 0))
+    if paused:
+        paused_text = font.render("[ PAUSED ]", True, (255, 0, 0))
+        screen.blit(paused_text, (WINDOW_WIDTH - 120, 10))
+
+def draw_wrapped_text(surface, text, x, y, max_width, font, color):
+    words = text.split(' ')
+    lines = []
+    current_line = ''
+    for word in words:
+        test_line = current_line + word + ' '
+        if font.size(test_line)[0] < max_width:
+            current_line = test_line
+        else:
+            lines.append(current_line)
+            current_line = word + ' '
+    lines.append(current_line)
+
+    for i, line in enumerate(lines):
+        rendered_text = font.render(line.strip(), True, color)
+        surface.blit(rendered_text, (x, y + i * font.get_linesize()))
+
+
+# === Home Base System ===
+class HomeBase:
+    def __init__(self, x, y, color):
+        self.x = x
+        self.y = y
+        self.width = 10
+        self.height = 8
+        self.color = color
+        self.food_stored = 0
+        self.water_stored = 0
+        self.reproduction_cooldown = 0
+
+    def draw(self, screen, tile_size, font):
+        for dy in range(self.height):
+            for dx in range(self.width):
+                px = (self.x + dx) * tile_size
+                py = (self.y + dy) * tile_size
+                pygame.draw.rect(screen, (139, 69, 19), (px, py, tile_size, tile_size))
+
+        # Draw food and water counters above the base
+        food_text = font.render(f"F:{self.food_stored}", True, (255, 255, 255))
+        water_text = font.render(f"W:{self.water_stored}", True, (100, 180, 255))
+        center_x = (self.x + self.width // 2) * tile_size
+
+        screen.blit(food_text, (center_x - food_text.get_width() // 2, (self.y - 2) * tile_size))
+        screen.blit(water_text, (center_x - water_text.get_width() // 2, (self.y) * tile_size))
+
+    def contains(self, x, y):
+        return self.x <= x < self.x + self.width and self.y <= y < self.y + self.height
+
+home_bases = []
+
+def place_home_base(x, y, color):
+    base = HomeBase(x, y, color)
+    home_bases.append(base)
+
+def emit_base_scent():
+    for base in home_bases:
+        for dy in range(-2, base.height + 2):
+            for dx in range(-2, base.width + 2):
+                x = base.x + dx
+                y = base.y + dy
+                if 0 <= x < GRID_WIDTH and 0 <= y < GRID_HEIGHT:
+                    scent_map[y][x] += 0.5  # Increase scent near base
+
+
+# === Lifeform Class ===
+class Lifeform:
+    def __init__(self, x, y, color=(0, 0, 255), speed=1):
+        self.x = x
+        self.y = y
+        self.age = 0
+        self.energy = 100
+        self.max_energy = 200
+        self.water = 150
+        self.max_water = 200
+        self.max_age = random.randint(600, 800)
+        self.color = color
+        self.speed = speed
+        self.carrying_food = 0
+        self.max_carry = 3
+        self.carrying_water = 0
+        self.max_water_carry = 5
+        self.state = "searching"
+        self.base = self.find_matching_base()
+        self.reproduction_cooldown = 0
+
+    def find_matching_base(self):
+        for base in home_bases:
+            if base.color == self.color:
+                return base
+        return None
+
+    def draw(self):
+        px = self.x * TILE_SIZE
+        py = self.y * TILE_SIZE
+        pygame.draw.rect(screen, self.color, (px, py, TILE_SIZE, TILE_SIZE))
+
+    def is_dead(self):
+        return self.energy <= 0 or self.water <= 0 or self.age >= self.max_age
+
+    def move_toward_food(self):
+        best_x, best_y = self.x, self.y
+        best_scent = -1
+        for dy in [-1, 0, 1]:
+            for dx in [-1, 0, 1]:
+                nx = self.x + dx
+                ny = self.y + dy
+                if 0 <= nx < GRID_WIDTH and 0 <= ny < GRID_HEIGHT:
+                    if scent_map[ny][nx] > best_scent:
+                        best_scent = scent_map[ny][nx]
+                        best_x, best_y = nx, ny
+        self.x = best_x
+        self.y = best_y
+
+    def move_toward(self, target_x, target_y):
+        dx = target_x - self.x
+        dy = target_y - self.y
+        dx = dx // abs(dx) if dx != 0 else 0
+        dy = dy // abs(dy) if dy != 0 else 0
+
+        directions = [(dx, dy), (dx, 0), (0, dy)]
+        for move_dx, move_dy in directions:
+            nx = self.x + move_dx
+            ny = self.y + move_dy
+            if 0 <= nx < GRID_WIDTH and 0 <= ny < GRID_HEIGHT:
+                self.x = nx
+                self.y = ny
+                break
+
+    def eat_food(self):
+        if food_grid[self.y][self.x] > 0:
+            food_grid[self.y][self.x] -= 1
+            self.energy = min(self.energy + 25, self.max_energy)
+            return True
+        return False
+
+    def update(self):
+        self.check_reproduction()
+        self.age += 1
+        self.energy -= 0.5
+        self.water -= 0.5
+
+        if self.reproduction_cooldown > 0:
+            self.reproduction_cooldown -= 1
+
+        # Drink from carried water
+        if self.water < 100 and self.carrying_water > 0:
+            amount = min(10, self.max_water - self.water, self.carrying_water)
+            self.water += amount
+            self.carrying_water -= amount
+
+        # Drink from base
+        if self.base and self.base.contains(self.x, self.y) and self.water < 100 and self.base.water_stored > 0:
+            amount = min(20, self.max_water - self.water, self.base.water_stored)
+            self.water += amount
+            self.base.water_stored -= amount
+
+        # Collect water from environment
+        if world[self.y][self.x] == "water" and self.carrying_water < self.max_water_carry:
+            self.carrying_water = self.max_water_carry
+            self.state = "returning"
+
+        # Return to base if full
+        if self.carrying_food >= self.max_carry or self.carrying_water >= self.max_water_carry:
+            self.state = "returning"
+
+        # Return to base
+        if self.state == "returning":
+            if self.base:
+                bx = self.base.x + self.base.width // 2
+                by = self.base.y + self.base.height // 2
+                self.move_toward(bx, by)
+                if self.base.contains(self.x, self.y):
+                    self.base.food_stored += self.carrying_food
+                    self.base.water_stored += self.carrying_water
+                    self.carrying_food = 0
+                    self.carrying_water = 0
+                    self.state = "searching"
+            return
+
+        # Eat if low on energy
+        if self.energy < 30:
+            if self.eat_food():
+                return
+            elif self.base and self.base.contains(self.x, self.y) and self.base.food_stored > 0:
+                self.base.food_stored -= 1
+                self.energy = min(self.energy + 25, self.max_energy)
+                return
+
+        # Search for food
+        if self.state == "searching":
+            self.move_toward_food()
+            if food_grid[self.y][self.x] > 0:
+                food_grid[self.y][self.x] -= 1
+                self.carrying_food += 1
+                if self.carrying_food >= self.max_carry:
+                    self.state = "returning"
+
+# === Base Proximity Check === (For Reproduction)
+    def near_or_inside_base(self):
+        if not self.base:
+            return False
+        for dy in range(-2, self.base.height + 2):
+            for dx in range(-2, self.base.width + 2):
+                x = self.base.x + dx
+                y = self.base.y + dy
+                if 0 <= x < GRID_WIDTH and 0 <= y < GRID_HEIGHT:
+                    if self.x == x and self.y == y:
+                        return True
+        return False
+
+    def check_reproduction(self):
+        if self.age < MIN_REPRO_AGE:
+            return
+        if not self.near_or_inside_base():
+            return
+        if self.reproduction_cooldown > 0:
+            return
+        if self.energy < 40 or self.water < 40:
+            return
+
+        for other in lifeforms:
+            if other is self:
+                continue
+            if other.reproduction_cooldown > 0:
+                continue
+            if other.energy < 60 or other.water < 60:
+                continue
+            if other.age < MIN_REPRO_AGE:
+                continue
+            if abs(self.x - other.x) <= 2 and abs(self.y - other.y) <= 2:
+                # Find an empty grass tile nearby to spawn the child
+                for dy in range(-2, 3):
+                    for dx in range(-2, 3):
+                        nx = self.x + dx
+                        ny = self.y + dy
+                        if 0 <= nx < GRID_WIDTH and 0 <= ny < GRID_HEIGHT:
+                            if world[ny][nx] != "water" and not any(lf.x == nx and lf.y == ny for lf in lifeforms):
+                                child = Lifeform(nx, ny, color=self.color)
+                                lifeforms.append(child)
+                                self.reproduction_cooldown = 20
+                                other.reproduction_cooldown = 20
+                                print(f"Reproduced at ({nx}, {ny}) by {self.color}")
+                                return
+
+
+# === AI Leader Entity (Internal Spawn Agent) ===
+class LeaderAI:
+    def __init__(self):
+        self.tick_counter = 0
+        self.spawn_interval = 60
+        self.spawn_limit = 500
+
+    def act(self):
+        self.tick_counter += 1
+        if self.tick_counter % self.spawn_interval == 0 and len(lifeforms) < self.spawn_limit:
+            self.spawn_life()
+
+    def spawn_life(self):
+        for _ in range(10):
+            x = random.randint(0, GRID_WIDTH - 1)
+            y = random.randint(0, GRID_HEIGHT - 1)
+            if world[y][x] == "grass":
+                lifeforms.append(Lifeform(x, y))
+                break
+
+
+# === Simulation Setup ===
+leader = LeaderAI()
+place_home_base(10, 10, (0, 0, 255))  # Manually place a blue team base
+
+print("Simulation initialized successfully.")
+
+
+# === Main Simulation Loop ===
+while True:
+    clock.tick(30)
+    tick_counter += 1
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            save_memory()
+            pygame.quit()
+            sys.exit()
+        elif event.type == pygame.KEYDOWN:
+            if input_active:
+                if event.key == pygame.K_RETURN:
+                    user_guidance = user_input
+                    user_input = ""
+                    input_active = False
+                elif event.key == pygame.K_BACKSPACE:
+                    user_input = user_input[:-1]
+                else:
+                    user_input += event.unicode
+            else:
+                if event.key == pygame.K_RETURN:
+                    input_active = True
+                elif event.key == pygame.K_SPACE:
+                    paused = not paused
+
+    # Pause Handling
+    if paused:
+        screen.fill((0, 0, 0))
+        draw_chat_box()
+        draw_counters()
+        pygame.display.flip()
+        continue
+
+    # Clear screen
+    screen.fill((0, 0, 0))
+    pygame.draw.rect(screen, (20, 20, 20), (GRID_WIDTH * TILE_SIZE, 0, 500, WINDOW_HEIGHT))
+
+    # AI Decision Phase
+    leader.act()
+    if leader.tick_counter % AI_DECISION_INTERVAL == 0:
+        snapshot = get_world_snapshot()
+        decision = ask_ai_leader(snapshot)
+        ai_response_text = decision.get("reason", "")
+        apply_ai_action(decision)
+
+    # Environment Updates
+    update_scent_map()
+    regrow_food()
+    regenerate_fertility()
+    emit_base_scent()
+
+    # Draw World
+    for y in range(GRID_HEIGHT):
+        for x in range(GRID_WIDTH):
+            pygame.draw.rect(screen, TERRAIN_TYPES[world[y][x]], (x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE))
+            if food_grid[y][x] > 0:
+                pygame.draw.rect(screen, (255, 255, 0), (x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE), 1)
+
+    # Update & Draw Lifeforms
+    for lf in lifeforms[:]:
+        lf.update()
+        lf.draw()
+        if lf.is_dead():
+            lifeforms.remove(lf)
+
+    # Update Population Metrics
+    highest_population = max(highest_population, len(lifeforms))
+
+    # Draw UI
+    draw_counters()
+    draw_chat_box()
+    for base in home_bases:
+        base.draw(screen, TILE_SIZE, font)
+
+    pygame.display.flip()
